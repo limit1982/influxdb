@@ -122,12 +122,7 @@ func (s *Service) UpdateVariable(ctx context.Context, id platform.ID, update *pl
 	}
 	now := s.Now()
 	variable.UpdatedAt = now
-	if err := update.Apply(variable); err != nil {
-		return nil, &platform.Error{
-			Op:  op,
-			Err: err,
-		}
-	}
+	update.Apply(variable)
 
 	if err := s.ReplaceVariable(ctx, variable); err != nil {
 		return nil, &platform.Error{

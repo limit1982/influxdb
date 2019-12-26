@@ -337,12 +337,7 @@ func (c *Client) UpdateVariable(ctx context.Context, id platform.ID, update *pla
 			}
 		}
 
-		if err := update.Apply(m); err != nil {
-			return &platform.Error{
-				Op:  op,
-				Err: err,
-			}
-		}
+		update.Apply(m)
 
 		variable = m
 		if pe = c.putVariable(ctx, tx, variable); pe != nil {
