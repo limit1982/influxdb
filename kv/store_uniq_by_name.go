@@ -2,6 +2,8 @@ package kv
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -13,121 +15,141 @@ type Entity struct {
 	ID    influxdb.ID
 	Name  string
 	OrgID influxdb.ID
-	Body  []byte
+	Body  interface{}
 }
 
-func (e Entity) indexKey(caseInsensitive bool) ([]byte, error) {
-	return indexByOrgNameKey(e.OrgID, e.Name, caseInsensitive)
+type EncodeEntFn func(ent Entity) ([]byte, string, error)
+
+func EncIDKey(ent Entity) ([]byte, string, error) {
+	id, err := ent.ID.Encode()
+	return id, "ID", err
 }
 
-type uniqByNameStore struct {
-	kv              Store
-	caseInsensitive bool
-	resource        string
-	bktName         []byte
-	indexName       []byte
-
-	decodeBucketEntFn func(key, val []byte) ([]byte, interface{}, error)
-	decodeOrgNameFn   func(body []byte) (orgID influxdb.ID, name string, err error)
+func EncOrgNameKeyFn(caseSensitive bool) func(ent Entity) ([]byte, string, error) {
+	return func(ent Entity) ([]byte, string, error) {
+		key, err := indexByOrgNameKey(ent.OrgID, ent.Name, caseSensitive)
+		return key, "organization ID and name", err
+	}
 }
 
-func (s *uniqByNameStore) Init(ctx context.Context) error {
-	span, ctx := tracing.StartSpanFromContext(ctx)
-	defer span.Finish()
-
-	return s.kv.Update(ctx, func(tx Tx) error {
-		return s.initBuckets(ctx, tx)
-	})
+func EncBodyJSON(ent Entity) ([]byte, string, error) {
+	v, err := json.Marshal(ent.Body)
+	return v, "entity body", err
 }
 
-func (s *uniqByNameStore) initBuckets(ctx context.Context, tx Tx) error {
-	bktFn := func(ctx context.Context, tx Tx, name []byte) error {
-		span, _ := tracing.StartSpanFromContextWithOperationName(ctx, string(name)+"_bucket")
-		defer span.Finish()
+type DecodeBucketEntFn func(key, val []byte) (keyRepeat []byte, decodedVal interface{}, err error)
 
-		_, err := tx.Bucket(name)
-		return err
+func DecIndexEntFn(key, val []byte) ([]byte, interface{}, error) {
+	var i influxdb.ID
+	return key, i, i.Decode(val)
+}
+
+type DecodedValToEntFn func(k []byte, v interface{}) (Entity, error)
+
+func DecodeOrgNameKey(k []byte) (influxdb.ID, string, error) {
+	var orgID influxdb.ID
+	if err := orgID.Decode(k[:influxdb.IDLength]); err != nil {
+		return 0, "", err
+	}
+	return orgID, string(k[influxdb.IDLength:]), nil
+}
+
+func newIndexStore(kv Store, resource string, bktName []byte, caseSensitive bool) *store {
+	var decValToEntFn DecodedValToEntFn = func(k []byte, v interface{}) (Entity, error) {
+		orgID, name, err := DecodeOrgNameKey(k)
+		if err != nil {
+			return Entity{}, err
+		}
+
+		idBytes, ok := v.([]byte)
+		if err := errUnexpectedDecodeVal(ok); err != nil {
+			return Entity{}, err
+		}
+
+		ent := Entity{OrgID: orgID, Name: name}
+		return ent, ent.ID.Decode(idBytes)
 	}
 
-	for _, name := range [][]byte{s.bktName, s.indexName} {
-		if err := bktFn(ctx, tx, name); err != nil {
-			return &influxdb.Error{
-				Code: influxdb.EInternal,
-				Msg:  fmt.Sprintf("failed to create index: %s", string(name)),
-				Err:  err,
-			}
+	return newStore(kv, resource, bktName, EncOrgNameKeyFn(caseSensitive), EncIDKey, DecIndexEntFn, decValToEntFn)
+}
+
+type store struct {
+	kv       Store
+	resource string
+	bktName  []byte
+
+	encodeEntKeyFn    EncodeEntFn
+	encodeEntBodyFn   EncodeEntFn
+	decodeBucketEntFn DecodeBucketEntFn
+	decodeToEntFn     DecodedValToEntFn
+}
+
+func newStore(kv Store, resource string, bktName []byte, encKeyFn, encBodyFn EncodeEntFn, decFn DecodeBucketEntFn, decToEntFn DecodedValToEntFn) *store {
+	return &store{
+		kv:                kv,
+		resource:          resource,
+		bktName:           bktName,
+		encodeEntKeyFn:    encKeyFn,
+		encodeEntBodyFn:   encBodyFn,
+		decodeBucketEntFn: decFn,
+		decodeToEntFn:     decToEntFn,
+	}
+}
+
+func (s *store) Init(ctx context.Context, tx Tx) error {
+	span, _ := tracing.StartSpanFromContextWithOperationName(ctx, "bucket_"+string(s.bktName))
+	defer span.Finish()
+
+	if _, err := s.bucket(ctx, tx); err != nil {
+		return &influxdb.Error{
+			Code: influxdb.EInternal,
+			Msg:  fmt.Sprintf("failed to create bucket: %s", string(s.bktName)),
+			Err:  err,
 		}
 	}
 	return nil
 }
 
-func (s *uniqByNameStore) Delete(ctx context.Context, tx Tx, id influxdb.ID) error {
+type DeleteOpts struct {
+	DeleteRelationFns []func(k []byte, v interface{}) error
+	FilterFn          func(k []byte, v interface{}) bool
+}
+
+func (s *store) Delete(ctx context.Context, tx Tx, opts DeleteOpts) error {
 	span, ctx := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
-	existing, err := s.FindByID(ctx, tx, id)
-	if err != nil {
-		return err
+	if opts.FilterFn == nil {
+		return nil
 	}
 
-	orgID, name, err := s.decodeOrgNameFn(existing)
-	if err != nil {
-		return &influxdb.Error{
-			Code: influxdb.EInternal,
-			Msg:  "failed to decoded body",
-			Err:  err,
+	var o influxdb.FindOptions
+	return s.Find(ctx, tx, o, opts.FilterFn, func(k []byte, v interface{}) error {
+		for _, deleteFn := range opts.DeleteRelationFns {
+			if err := deleteFn(k, v); err != nil {
+				return err
+			}
 		}
-	}
-
-	if err := s.deleteEnt(ctx, tx, id); err != nil {
-		return err
-	}
-	return s.deleteInIndex(ctx, tx, orgID, name)
+		return s.bucketDelete(ctx, tx, k)
+	})
 }
 
-func (s *uniqByNameStore) deleteEnt(ctx context.Context, tx Tx, id influxdb.ID) error {
+func (s *store) DeleteEnt(ctx context.Context, tx Tx, ent Entity) error {
 	span, ctx := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
-	bkt, err := s.bucket(ctx, tx, s.bktName)
+	encodedID, err := s.encodeEnt(ctx, ent, s.encodeEntKeyFn)
 	if err != nil {
 		return err
 	}
-
-	encodedID, err := id.Encode()
-	if err != nil {
-		return err
-	}
-	return bkt.Delete(encodedID)
+	return s.bucketDelete(ctx, tx, encodedID)
 }
 
-func (s *uniqByNameStore) deleteInIndex(ctx context.Context, tx Tx, orgID influxdb.ID, name string) error {
+func (s *store) Find(ctx context.Context, tx Tx, opt influxdb.FindOptions, filterFn func(k []byte, v interface{}) bool, captureFn func(k []byte, v interface{}) error) error {
 	span, ctx := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
-	bkt, err := s.bucket(ctx, tx, s.indexName)
-	if err != nil {
-		return err
-	}
-
-	encodedID, err := indexByOrgNameKey(orgID, name, s.caseInsensitive)
-	if err != nil {
-		return err
-	}
-
-	return s.bucketDelete(ctx, bkt, encodedID)
-}
-
-func (s *uniqByNameStore) Find(ctx context.Context, tx Tx, opt influxdb.FindOptions, filterFn func(k []byte, v interface{}) bool, captureFn func(k []byte, v interface{})) error {
-	span, ctx := tracing.StartSpanFromContext(ctx)
-	defer span.Finish()
-
-	bkt, err := s.bucket(ctx, tx, s.bktName)
-	if err != nil {
-		return err
-	}
-
-	cur, err := s.bucketCursor(ctx, bkt)
+	cur, err := s.bucketCursor(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -142,112 +164,68 @@ func (s *uniqByNameStore) Find(ctx context.Context, tx Tx, opt influxdb.FindOpti
 	}
 
 	for k, v := iter.Next(ctx); k != nil; k, v = iter.Next(ctx) {
-		captureFn(k, v)
+		if err := captureFn(k, v); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (s *uniqByNameStore) FindByID(ctx context.Context, tx Tx, id influxdb.ID) ([]byte, error) {
-	span, ctx := tracing.StartSpanFromContext(ctx)
-	defer span.Finish()
-
-	encodedID, err := id.Encode()
+func (s *store) FindEnt(ctx context.Context, tx Tx, ent Entity) (interface{}, error) {
+	encodedID, err := s.encodeEnt(ctx, ent, s.encodeEntKeyFn)
 	if err != nil {
-		return nil, &influxdb.Error{
-			Code: influxdb.EInvalid,
-			Msg:  fmt.Sprintf("provided %s ID is an invalid format", s.resource),
-		}
+		// TODO: fix this error up
+		return nil, err
 	}
 
-	return s.findByKey(ctx, tx, s.bktName, encodedID)
-}
-
-func (s *uniqByNameStore) FindByName(ctx context.Context, tx Tx, orgID influxdb.ID, name string) ([]byte, error) {
-	span, ctx := tracing.StartSpanFromContext(ctx)
-	defer span.Finish()
-
-	indexKey, err := indexByOrgNameKey(orgID, name, s.caseInsensitive)
+	body, err := s.bucketGet(ctx, tx, encodedID)
 	if err != nil {
 		return nil, err
 	}
 
-	encodedID, err := s.findByKey(ctx, tx, s.indexName, indexKey)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.findByKey(ctx, tx, s.bktName, encodedID)
+	return s.decodeEnt(ctx, body)
 }
 
-func (s *uniqByNameStore) findByKey(ctx context.Context, tx Tx, bktName, key []byte) ([]byte, error) {
+func (s *store) Put(ctx context.Context, tx Tx, ent Entity) error {
 	span, ctx := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
-	bkt, err := s.bucket(ctx, tx, bktName)
+	encodedID, err := s.encodeEnt(ctx, ent, s.encodeEntKeyFn)
 	if err != nil {
-		return nil, err
-	}
-
-	return s.bucketGet(ctx, bkt, key)
-}
-
-func (s *uniqByNameStore) Put(ctx context.Context, tx Tx, ent Entity) error {
-	span, ctx := tracing.StartSpanFromContext(ctx)
-	defer span.Finish()
-
-	if err := s.putIndexKey(ctx, tx, ent); err != nil {
 		return err
 	}
 
-	return s.putEnt(ctx, tx, ent)
+	body, err := s.encodeEnt(ctx, ent, s.encodeEntBodyFn)
+	if err != nil {
+		return err
+	}
+
+	return s.bucketPut(ctx, tx, encodedID, body)
 }
 
-func (s *uniqByNameStore) putEnt(ctx context.Context, tx Tx, ent Entity) error {
-	span, ctx := tracing.StartSpanFromContext(ctx)
+func (s *store) bucket(ctx context.Context, tx Tx) (Bucket, error) {
+	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
-	encodedID, err := ent.ID.Encode()
+	bkt, err := tx.Bucket(s.bktName)
 	if err != nil {
-		return &influxdb.Error{
-			Code: influxdb.EInvalid,
-			Msg:  fmt.Sprintf("invalid %s ID provided: %q", s.resource, ent.ID.String()),
+		return nil, &influxdb.Error{
+			Code: influxdb.EInternal,
+			Msg:  fmt.Sprintf("unexpected error retrieving bucket %q; Err %v", string(s.bktName), err),
 			Err:  err,
 		}
 	}
-
-	bkt, err := s.bucket(ctx, tx, s.bktName)
-	if err != nil {
-		return err
-	}
-
-	return s.bucketPut(ctx, bkt, encodedID, ent.Body)
+	return bkt, nil
 }
 
-func (s *uniqByNameStore) putIndexKey(ctx context.Context, tx Tx, ent Entity) error {
-	span, ctx := tracing.StartSpanFromContext(ctx)
-	defer span.Finish()
-
-	indexKey, err := ent.indexKey(s.caseInsensitive)
-	if err != nil {
-		return err
-	}
-
-	encodedID, err := ent.ID.Encode()
-	if err != nil {
-		return err
-	}
-
-	indexBucket, err := s.bucket(ctx, tx, s.indexName)
-	if err != nil {
-		return err
-	}
-
-	return s.bucketPut(ctx, indexBucket, indexKey, encodedID)
-}
-
-func (s *uniqByNameStore) bucketCursor(ctx context.Context, b Bucket) (Cursor, error) {
+func (s *store) bucketCursor(ctx context.Context, tx Tx) (Cursor, error) {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
+
+	b, err := s.bucket(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 
 	cur, err := b.Cursor()
 	if err != nil {
@@ -260,22 +238,39 @@ func (s *uniqByNameStore) bucketCursor(ctx context.Context, b Bucket) (Cursor, e
 	return cur, nil
 }
 
-func (s *uniqByNameStore) bucketDelete(ctx context.Context, b Bucket, key []byte) error {
+func (s *store) bucketDelete(ctx context.Context, tx Tx, key []byte) error {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
-	if err := b.Delete(key); err != nil {
-		return &influxdb.Error{
-			Code: influxdb.EInternal,
-			Err:  err,
-		}
+	b, err := s.bucket(ctx, tx)
+	if err != nil {
+		return err
 	}
-	return nil
+
+	err = b.Delete(key)
+	if err == nil {
+		return nil
+	}
+
+	iErr := &influxdb.Error{
+		Code: influxdb.EInternal,
+		Err:  err,
+	}
+	if IsNotFound(err) {
+		iErr.Code = influxdb.ENotFound
+		iErr.Msg = fmt.Sprintf("%s does exist for key: %q", s.resource, string(key))
+	}
+	return iErr
 }
 
-func (s *uniqByNameStore) bucketGet(ctx context.Context, b Bucket, key []byte) ([]byte, error) {
+func (s *store) bucketGet(ctx context.Context, tx Tx, key []byte) ([]byte, error) {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
+
+	b, err := s.bucket(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 
 	body, err := b.Get(key)
 	if IsNotFound(err) {
@@ -294,9 +289,14 @@ func (s *uniqByNameStore) bucketGet(ctx context.Context, b Bucket, key []byte) (
 	return body, nil
 }
 
-func (s *uniqByNameStore) bucketPut(ctx context.Context, b Bucket, key, body []byte) error {
+func (s *store) bucketPut(ctx context.Context, tx Tx, key, body []byte) error {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
+
+	b, err := s.bucket(ctx, tx)
+	if err != nil {
+		return err
+	}
 
 	if err := b.Put(key, body); err != nil {
 		return &influxdb.Error{
@@ -307,19 +307,145 @@ func (s *uniqByNameStore) bucketPut(ctx context.Context, b Bucket, key, body []b
 	return nil
 }
 
-func (s *uniqByNameStore) bucket(ctx context.Context, tx Tx, bktName []byte) (Bucket, error) {
+func (s *store) decodeEnt(ctx context.Context, body []byte) (interface{}, error) {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
-	bkt, err := tx.Bucket(bktName)
+	_, v, err := s.decodeBucketEntFn([]byte{}, body) // ignore key here
 	if err != nil {
 		return nil, &influxdb.Error{
 			Code: influxdb.EInternal,
-			Msg:  fmt.Sprintf("unexpected error retrieving bucket %q; Err %v", string(bktName), err),
+			Msg:  fmt.Sprintf("failed to decode %s body", s.resource),
 			Err:  err,
 		}
 	}
-	return bkt, nil
+	return v, nil
+}
+
+func (s *store) encodeEnt(ctx context.Context, ent Entity, fn EncodeEntFn) ([]byte, error) {
+	span, _ := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	encoded, field, err := fn(ent)
+	if err != nil {
+		return nil, &influxdb.Error{
+			Code: influxdb.EInvalid,
+			Msg:  fmt.Sprintf("provided %s %s is an invalid format", s.resource, field),
+			Err:  err,
+		}
+	}
+	return encoded, nil
+}
+
+type uniqByNameStore struct {
+	resource   string
+	entStore   *store
+	indexStore *store
+
+	decodeEntOrgNameFn func(i interface{}) (orgID influxdb.ID, name string, err error)
+}
+
+func (s *uniqByNameStore) Init(ctx context.Context, tx Tx) error {
+	span, ctx := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	initFns := []func(context.Context, Tx) error{
+		s.entStore.Init,
+		s.indexStore.Init,
+	}
+	for _, fn := range initFns {
+		if err := fn(ctx, tx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *uniqByNameStore) Delete(ctx context.Context, tx Tx, opts DeleteOpts) error {
+	span, ctx := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	deleteRelationFn := func(k []byte, v interface{}) error {
+		ent, err := s.entStore.decodeToEntFn(k, v)
+		if err != nil {
+			return err
+		}
+		return s.indexStore.DeleteEnt(ctx, tx, ent)
+	}
+	opts.DeleteRelationFns = append(opts.DeleteRelationFns, deleteRelationFn)
+	return s.entStore.Delete(ctx, tx, opts)
+}
+
+func (s *uniqByNameStore) DeleteEnt(ctx context.Context, tx Tx, id influxdb.ID) error {
+	span, ctx := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	existing, err := s.FindByID(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+
+	orgID, name, err := s.decodeEntOrgName(existing)
+	if err != nil {
+		return err
+	}
+
+	if err := s.entStore.DeleteEnt(ctx, tx, Entity{ID: id}); err != nil {
+		return err
+	}
+
+	return s.indexStore.DeleteEnt(ctx, tx, Entity{OrgID: orgID, Name: name})
+}
+
+func (s *uniqByNameStore) Find(ctx context.Context, tx Tx, opt influxdb.FindOptions, filterFn func(k []byte, v interface{}) bool, captureFn func(k []byte, v interface{}) error) error {
+	span, ctx := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	return s.entStore.Find(ctx, tx, opt, filterFn, captureFn)
+}
+
+func (s *uniqByNameStore) FindByID(ctx context.Context, tx Tx, id influxdb.ID) (interface{}, error) {
+	span, ctx := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	return s.entStore.FindEnt(ctx, tx, Entity{ID: id})
+}
+
+func (s *uniqByNameStore) FindByName(ctx context.Context, tx Tx, ent Entity) (interface{}, error) {
+	span, ctx := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	idxEncodedID, err := s.indexStore.FindEnt(ctx, tx, ent)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.entStore.FindEnt(ctx, tx, Entity{
+		ID: idxEncodedID.(influxdb.ID),
+	})
+}
+
+func (s *uniqByNameStore) Put(ctx context.Context, tx Tx, ent Entity) error {
+	span, ctx := tracing.StartSpanFromContext(ctx)
+	defer span.Finish()
+
+	if err := s.indexStore.Put(ctx, tx, ent); err != nil {
+		return err
+	}
+
+	return s.entStore.Put(ctx, tx, ent)
+}
+
+func (s *uniqByNameStore) decodeEntOrgName(v interface{}) (influxdb.ID, string, error) {
+	orgID, name, err := s.decodeEntOrgNameFn(v)
+	if err != nil {
+		return 0, "", &influxdb.Error{
+			Code: influxdb.EInternal,
+			Msg:  "failed to decoded body",
+			Err:  err,
+		}
+	}
+	return orgID, name, nil
 }
 
 type Iter struct {
@@ -393,7 +519,7 @@ func (i *Iter) isNext(k []byte, v interface{}) bool {
 	return true
 }
 
-func indexByOrgNameKey(orgID influxdb.ID, name string, caseInsensitive bool) ([]byte, error) {
+func indexByOrgNameKey(orgID influxdb.ID, name string, caseSensitive bool) ([]byte, error) {
 	if name == "" {
 		return nil, &influxdb.Error{
 			Code: influxdb.EInvalid,
@@ -411,9 +537,16 @@ func indexByOrgNameKey(orgID influxdb.ID, name string, caseInsensitive bool) ([]
 	}
 	k := make([]byte, influxdb.IDLength+len(name))
 	copy(k, orgIDEncoded)
-	if caseInsensitive {
+	if !caseSensitive {
 		name = strings.ToLower(name)
 	}
 	copy(k[influxdb.IDLength:], name)
 	return k, nil
+}
+
+func errUnexpectedDecodeVal(ok bool) error {
+	if ok {
+		return nil
+	}
+	return errors.New("unexpected value decoded")
 }

@@ -143,7 +143,7 @@ func (s *Service) Initialize(ctx context.Context) error {
 			return err
 		}
 
-		if err := s.variableStore.initBuckets(ctx, tx); err != nil {
+		if err := s.variableStore.Init(ctx, tx); err != nil {
 			return err
 		}
 
@@ -155,7 +155,7 @@ func (s *Service) Initialize(ctx context.Context) error {
 			return err
 		}
 
-		if err := s.endpointStore.initBuckets(ctx, tx); err != nil {
+		if err := s.endpointStore.Init(ctx, tx); err != nil {
 			return err
 		}
 

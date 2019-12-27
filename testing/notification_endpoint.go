@@ -2113,7 +2113,7 @@ func DeleteNotificationEndpoint(
 				iErr, ok := err.(*influxdb.Error)
 				require.True(t, ok)
 				assert.Equal(t, tt.wants.err.Code, iErr.Code)
-				assert.True(t, strings.HasPrefix(iErr.Error(), tt.wants.err.Error()))
+				assert.Truef(t, strings.HasPrefix(iErr.Error(), tt.wants.err.Error()), "got error: %+v", iErr)
 				return
 			}
 			if diff := cmp.Diff(flds, tt.wants.secretFlds); diff != "" {

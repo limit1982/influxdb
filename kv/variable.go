@@ -16,20 +16,36 @@ var (
 )
 
 func newVariableUniqueByNameStore(kv Store) *uniqByNameStore {
+	const resource = "variable"
+
+	var decodeVarEntFn DecodeBucketEntFn = func(key, val []byte) ([]byte, interface{}, error) {
+		var v influxdb.Variable
+		return key, &v, json.Unmarshal(val, &v)
+	}
+
+	var decValToEntFn DecodedValToEntFn = func(_ []byte, i interface{}) (entity Entity, err error) {
+		v, ok := i.(*influxdb.Variable)
+		if err := errUnexpectedDecodeVal(ok); err != nil {
+			return Entity{}, err
+		}
+		return Entity{
+			ID:    v.ID,
+			Name:  v.Name,
+			OrgID: v.OrganizationID,
+			Body:  v,
+		}, nil
+	}
+
 	return &uniqByNameStore{
-		kv:              kv,
-		caseInsensitive: true,
-		resource:        "variable",
-		bktName:         []byte("variablesv1"),
-		indexName:       []byte("variablesindexv1"),
-		decodeBucketEntFn: func(key, val []byte) ([]byte, interface{}, error) {
-			var v influxdb.Variable
-			return key, &v, json.Unmarshal(val, &v)
-		},
-		decodeOrgNameFn: func(body []byte) (influxdb.ID, string, error) {
-			var v influxdb.Variable
-			err := json.Unmarshal(body, &v)
-			return v.ID, v.Name, err
+		resource:   resource,
+		entStore:   newStore(kv, resource, []byte("variablesv1"), EncIDKey, EncBodyJSON, decodeVarEntFn, decValToEntFn),
+		indexStore: newIndexStore(kv, resource, []byte("variablesindexv1"), false),
+		decodeEntOrgNameFn: func(v interface{}) (influxdb.ID, string, error) {
+			variable, ok := v.(*influxdb.Variable)
+			if err := errUnexpectedDecodeVal(ok); err != nil {
+				return 0, "", err
+			}
+			return variable.OrganizationID, variable.Name, nil
 		},
 	}
 }
@@ -113,8 +129,9 @@ func (s *Service) findVariables(ctx context.Context, tx Tx, filter influxdb.Vari
 	var o influxdb.FindOptions
 
 	var variables []*influxdb.Variable
-	err := s.variableStore.Find(ctx, tx, o, filterVariablesFn(filter), func(k []byte, v interface{}) {
+	err := s.variableStore.Find(ctx, tx, o, filterVariablesFn(filter), func(k []byte, v interface{}) error {
 		variables = append(variables, v.(*influxdb.Variable))
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -176,14 +193,8 @@ func (s *Service) findVariableByID(ctx context.Context, tx Tx, id influxdb.ID) (
 		return nil, err
 	}
 
-	var v influxdb.Variable
-	if err := json.Unmarshal(body, &v); err != nil {
-		return nil, &influxdb.Error{
-			Code: influxdb.EInternal,
-			Err:  err,
-		}
-	}
-	return &v, nil
+	variable, ok := body.(*influxdb.Variable)
+	return variable, errUnexpectedDecodeVal(ok)
 }
 
 // CreateVariable creates a new variable and assigns it an ID
@@ -198,7 +209,11 @@ func (s *Service) CreateVariable(ctx context.Context, v *influxdb.Variable) erro
 
 		v.Name = strings.TrimSpace(v.Name) // TODO: move to service layer
 
-		if _, err := s.variableStore.FindByName(ctx, tx, v.OrganizationID, v.Name); err == nil {
+		_, err := s.variableStore.FindByName(ctx, tx, Entity{
+			OrgID: v.OrganizationID,
+			Name:  v.Name,
+		})
+		if err == nil {
 			return &influxdb.Error{
 				Code: influxdb.EConflict,
 				Msg:  fmt.Sprintf("variable with name %s already exists", v.Name),
@@ -226,7 +241,11 @@ func (s *Service) ReplaceVariable(ctx context.Context, v *influxdb.Variable) err
 			}
 		}
 
-		if _, err := s.variableStore.FindByName(ctx, tx, v.OrganizationID, v.Name); err == nil {
+		_, err := s.variableStore.FindByName(ctx, tx, Entity{
+			OrgID: v.OrganizationID,
+			Name:  v.Name,
+		})
+		if err == nil {
 			return &influxdb.Error{
 				Code: influxdb.EConflict,
 				Msg:  fmt.Sprintf("variable with name %s already exists", v.Name),
@@ -279,19 +298,11 @@ func (s *Service) removeVariableOrgsIndex(ctx context.Context, tx Tx, variable *
 }
 
 func (s *Service) putVariable(ctx context.Context, tx Tx, v *influxdb.Variable) error {
-	m, err := json.Marshal(v)
-	if err != nil {
-		return &influxdb.Error{
-			Code: influxdb.EInternal,
-			Err:  err,
-		}
-	}
-
 	ent := Entity{
 		ID:    v.ID,
 		Name:  v.Name,
 		OrgID: v.OrganizationID,
-		Body:  m,
+		Body:  v,
 	}
 	return s.variableStore.Put(ctx, tx, ent)
 }
@@ -312,14 +323,14 @@ func (s *Service) UpdateVariable(ctx context.Context, id influxdb.ID, update *in
 			// TODO: should be moved to service layer
 			update.Name = strings.ToLower(strings.TrimSpace(update.Name))
 
-			vbytes, err := s.variableStore.FindByName(ctx, tx, v.OrganizationID, update.Name)
+			vbytes, err := s.variableStore.FindByName(ctx, tx, Entity{
+				OrgID: v.OrganizationID,
+				Name:  update.Name,
+			})
 			if err == nil {
-				var existingVar influxdb.Variable
-				if err := json.Unmarshal(vbytes, &existingVar); err != nil {
-					return &influxdb.Error{
-						Code: influxdb.EInternal,
-						Err:  err,
-					}
+				existingVar, ok := vbytes.(*influxdb.Variable)
+				if err := errUnexpectedDecodeVal(ok); err != nil {
+					return err
 				}
 				if existingVar.ID != v.ID {
 					return &influxdb.Error{
@@ -329,7 +340,11 @@ func (s *Service) UpdateVariable(ctx context.Context, id influxdb.ID, update *in
 				}
 			}
 
-			if err := s.variableStore.deleteInIndex(ctx, tx, v.OrganizationID, v.Name); err != nil {
+			err = s.variableStore.indexStore.DeleteEnt(ctx, tx, Entity{
+				OrgID: v.OrganizationID,
+				Name:  v.Name,
+			})
+			if err != nil {
 				return err
 			}
 			v.Name = update.Name
@@ -357,7 +372,7 @@ func (s *Service) DeleteVariable(ctx context.Context, id influxdb.ID) error {
 			}
 		}
 
-		return s.variableStore.Delete(ctx, tx, id)
+		return s.variableStore.DeleteEnt(ctx, tx, id)
 	})
 }
 
